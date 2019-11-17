@@ -843,10 +843,24 @@ fn basic_type_metadata(cx: &CodegenCx<'ll, 'tcx>, t: Ty<'tcx>) -> &'ll DIType {
         ty::Bool => ("bool", DW_ATE_boolean),
         ty::Char => ("char", DW_ATE_unsigned_char),
         ty::Int(int_ty) => {
-            (int_ty.name_str(), DW_ATE_signed)
+            let debug_name = match int_ty.name_str() {
+                "i8"    => "signed char",
+                "i16"   => "signed short",
+                "i32"   => "signed int",
+                "isize" => "signed long",
+                _ => int_ty.name_str(),
+            };
+            (debug_name, DW_ATE_signed)
         },
         ty::Uint(uint_ty) => {
-            (uint_ty.name_str(), DW_ATE_unsigned)
+            let debug_name = match uint_ty.name_str() {
+                "u8"    => "unsigned char",
+                "u16"   => "unsigned short",
+                "u32"   => "unsigned int",
+                "usize" => "unsigned long",
+                _ => uint_ty.name_str(),
+            };
+            (debug_name, DW_ATE_unsigned)
         },
         ty::Float(float_ty) => {
             (float_ty.name_str(), DW_ATE_float)
