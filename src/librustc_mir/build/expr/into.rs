@@ -65,7 +65,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     _ => false,
                 };
 
-                unpack!(block = this.as_local_rvalue(block, source));
+                // (#66975) Source could be a const of type `!`, so has to
+                // exist in the generated MIR.
+                unpack!(block = this.as_temp(
+                    block,
+                    this.local_scope(),
+                    source,
+                    Mutability::Mut,
+                ));
 
                 // This is an optimization. If the expression was a call then we already have an
                 // unreachable block. Don't bother to terminate it and create a new one.
@@ -227,11 +234,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         mutability: Mutability::Mut,
                         ty: ptr_ty,
                         user_ty: UserTypeProjections::none(),
-                        name: None,
                         source_info,
-                        visibility_scope: source_info.scope,
                         internal: true,
-                        is_user_variable: None,
+                        local_info: LocalInfo::Other,
                         is_block_tail: None,
                     });
                     let ptr_temp = Place::from(ptr_temp);
@@ -384,7 +389,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             // Avoid creating a temporary
             ExprKind::VarRef { .. } |
             ExprKind::SelfRef |
-            ExprKind::StaticRef { .. } |
             ExprKind::PlaceTypeAscription { .. } |
             ExprKind::ValueTypeAscription { .. } => {
                 debug_assert!(Category::of(&expr.kind) == Some(Category::Place));
@@ -426,6 +430,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Tuple { .. }
             | ExprKind::Closure { .. }
             | ExprKind::Literal { .. }
+            | ExprKind::StaticRef { .. }
             | ExprKind::Yield { .. } => {
                 debug_assert!(match Category::of(&expr.kind).unwrap() {
                     // should be handled above

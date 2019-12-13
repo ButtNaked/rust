@@ -1,4 +1,3 @@
-use crate::queries::Queries;
 use crate::util;
 pub use crate::passes::BoxedResolver;
 
@@ -21,7 +20,6 @@ use syntax::ast::{self, MetaItemKind};
 use syntax::token;
 use syntax::source_map::{FileName, FileLoader, SourceMap};
 use syntax::sess::ParseSess;
-use syntax_expand::config::process_configure_mod;
 use syntax_pos::edition;
 
 pub type Result<T> = result::Result<T, ErrorReported>;
@@ -37,7 +35,6 @@ pub struct Compiler {
     pub(crate) input_path: Option<PathBuf>,
     pub(crate) output_dir: Option<PathBuf>,
     pub(crate) output_file: Option<PathBuf>,
-    pub(crate) queries: Queries,
     pub(crate) crate_name: Option<String>,
     pub(crate) register_lints: Option<Box<dyn Fn(&Session, &mut lint::LintStore) + Send + Sync>>,
     pub(crate) override_queries:
@@ -69,7 +66,7 @@ impl Compiler {
 pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> FxHashSet<(String, Option<String>)> {
     syntax::with_default_globals(move || {
         let cfg = cfgspecs.into_iter().map(|s| {
-            let sess = ParseSess::with_silent_emitter(process_configure_mod);
+            let sess = ParseSess::with_silent_emitter();
             let filename = FileName::cfg_spec_source_code(&s);
             let mut parser = new_parser_from_source_str(&sess, filename, s.to_string());
 
@@ -170,7 +167,6 @@ pub fn run_compiler_in_existing_thread_pool<R>(
         input_path: config.input_path,
         output_dir: config.output_dir,
         output_file: config.output_file,
-        queries: Default::default(),
         crate_name: config.crate_name,
         register_lints: config.register_lints,
         override_queries: config.override_queries,

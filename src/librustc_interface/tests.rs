@@ -7,7 +7,7 @@ use rustc::middle::cstore;
 use rustc::session::config::{build_configuration, build_session_options, to_crate_config};
 use rustc::session::config::{LtoCli, LinkerPluginLto, SwitchWithOptPath, ExternEntry};
 use rustc::session::config::{Externs, OutputType, OutputTypes, SymbolManglingVersion};
-use rustc::session::config::{rustc_optgroups, Options, ErrorOutputType, Passes};
+use rustc::session::config::{rustc_optgroups, Options, ErrorOutputType, Passes, ExternLocation};
 use rustc::session::{build_session, Session};
 use rustc::session::search_paths::SearchPath;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +17,6 @@ use rustc_target::spec::{MergeFunctions, PanicStrategy, RelroLevel};
 use syntax::symbol::sym;
 use syntax::edition::{Edition, DEFAULT_EDITION};
 use syntax;
-use syntax_expand::config::process_configure_mod;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{ColorConfig, emitter::HumanReadableErrorType, registry};
 
@@ -32,21 +31,22 @@ fn build_session_options_and_crate_config(matches: getopts::Matches) -> (Options
 fn mk_session(matches: getopts::Matches) -> (Session, CfgSpecs) {
     let registry = registry::Registry::new(&[]);
     let (sessopts, cfg) = build_session_options_and_crate_config(matches);
-    let sess = build_session(sessopts, None, registry, process_configure_mod);
+    let sess = build_session(sessopts, None, registry);
     (sess, cfg)
 }
 
 fn new_public_extern_entry<S, I>(locations: I) -> ExternEntry
 where
     S: Into<String>,
-    I: IntoIterator<Item = Option<S>>,
+    I: IntoIterator<Item = S>,
 {
-    let locations: BTreeSet<_> = locations.into_iter().map(|o| o.map(|s| s.into()))
+    let locations: BTreeSet<_> = locations.into_iter().map(|s| s.into())
         .collect();
 
     ExternEntry {
-        locations,
-        is_private_dep: false
+        location: ExternLocation::ExactPaths(locations),
+        is_private_dep: false,
+        add_prelude: true,
     }
 }
 
@@ -161,33 +161,33 @@ fn test_externs_tracking_hash_different_construction_order() {
     v1.externs = Externs::new(mk_map(vec![
         (
             String::from("a"),
-            new_public_extern_entry(vec![Some("b"), Some("c")])
+            new_public_extern_entry(vec!["b", "c"])
         ),
         (
             String::from("d"),
-            new_public_extern_entry(vec![Some("e"), Some("f")])
+            new_public_extern_entry(vec!["e", "f"])
         ),
     ]));
 
     v2.externs = Externs::new(mk_map(vec![
         (
             String::from("d"),
-            new_public_extern_entry(vec![Some("e"), Some("f")])
+            new_public_extern_entry(vec!["e", "f"])
         ),
         (
             String::from("a"),
-            new_public_extern_entry(vec![Some("b"), Some("c")])
+            new_public_extern_entry(vec!["b", "c"])
         ),
     ]));
 
     v3.externs = Externs::new(mk_map(vec![
         (
             String::from("a"),
-            new_public_extern_entry(vec![Some("b"), Some("c")])
+            new_public_extern_entry(vec!["b", "c"])
         ),
         (
             String::from("d"),
-            new_public_extern_entry(vec![Some("f"), Some("e")])
+            new_public_extern_entry(vec!["f", "e"])
         ),
     ]));
 
@@ -649,10 +649,6 @@ fn test_debugging_options_tracking_hash() {
 
     opts = reference.clone();
     opts.debugging_opts.continue_parse_after_error = true;
-    assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
-
-    opts = reference.clone();
-    opts.debugging_opts.extra_plugins = vec![String::from("plugin1"), String::from("plugin2")];
     assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
     opts = reference.clone();

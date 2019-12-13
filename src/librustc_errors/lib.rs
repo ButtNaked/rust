@@ -38,6 +38,7 @@ pub mod registry;
 mod styled_buffer;
 mod lock;
 pub mod json;
+pub use snippet::Style;
 
 pub type PResult<'a, T> = Result<T, DiagnosticBuilder<'a>>;
 
@@ -574,6 +575,11 @@ impl Handler {
         DiagnosticBuilder::new(self, Level::Fatal, msg)
     }
 
+    /// Construct a builder at the `Help` level with the `msg`.
+    pub fn struct_help(&self, msg: &str) -> DiagnosticBuilder<'_> {
+        DiagnosticBuilder::new(self, Level::Help, msg)
+    }
+
     pub fn span_fatal(&self, span: impl Into<MultiSpan>, msg: &str) -> FatalError {
         self.emit_diag_at_span(Diagnostic::new(Fatal, msg), span);
         FatalError
@@ -987,3 +993,10 @@ macro_rules! pluralize {
         if $x != 1 { "s" } else { "" }
     };
 }
+
+// Useful type to use with `Result<>` indicate that an error has already
+// been reported to the user, so no need to continue checking.
+#[derive(Clone, Copy, Debug, RustcEncodable, RustcDecodable, Hash, PartialEq, Eq)]
+pub struct ErrorReported;
+
+rustc_data_structures::impl_stable_hash_via_hash!(ErrorReported);

@@ -65,9 +65,9 @@ impl LoweringContext<'_> {
                 let expr = P(self.lower_expr(expr));
                 hir::ExprKind::Type(expr, self.lower_ty(ty, ImplTraitContext::disallowed()))
             }
-            ExprKind::AddrOf(m, ref ohs) => {
+            ExprKind::AddrOf(k, m, ref ohs) => {
                 let ohs = P(self.lower_expr(ohs));
-                hir::ExprKind::AddrOf(m, ohs)
+                hir::ExprKind::AddrOf(k, m, ohs)
             }
             ExprKind::Let(ref pat, ref scrutinee) => self.lower_expr_let(e.span, pat, scrutinee),
             ExprKind::If(ref cond, ref then, ref else_opt) => {
@@ -966,7 +966,7 @@ impl LoweringContext<'_> {
     }
 
     fn lower_expr_asm(&mut self, asm: &InlineAsm) -> hir::ExprKind {
-        let hir_asm = hir::InlineAsm {
+        let inner = hir::InlineAsmInner {
             inputs: asm.inputs.iter().map(|&(ref c, _)| c.clone()).collect(),
             outputs: asm.outputs
                 .iter()
@@ -984,18 +984,18 @@ impl LoweringContext<'_> {
             alignstack: asm.alignstack,
             dialect: asm.dialect,
         };
-
-        let outputs = asm.outputs
-            .iter()
-            .map(|out| self.lower_expr(&out.expr))
-            .collect();
-
-        let inputs = asm.inputs
-            .iter()
-            .map(|&(_, ref input)| self.lower_expr(input))
-            .collect();
-
-        hir::ExprKind::InlineAsm(P(hir_asm), outputs, inputs)
+        let hir_asm = hir::InlineAsm {
+            inner,
+            inputs_exprs: asm.inputs
+                .iter()
+                .map(|&(_, ref input)| self.lower_expr(input))
+                .collect(),
+            outputs_exprs: asm.outputs
+                .iter()
+                .map(|out| self.lower_expr(&out.expr))
+                .collect(),
+        };
+        hir::ExprKind::InlineAsm(P(hir_asm))
     }
 
     fn lower_field(&mut self, f: &Field) -> hir::Field {
@@ -1339,7 +1339,11 @@ impl LoweringContext<'_> {
     }
 
     fn expr_mut_addr_of(&mut self, span: Span, e: P<hir::Expr>) -> hir::Expr {
-        self.expr(span, hir::ExprKind::AddrOf(hir::Mutability::Mutable, e), ThinVec::new())
+        self.expr(
+            span,
+            hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Mutable, e),
+            ThinVec::new(),
+        )
     }
 
     fn expr_unit(&mut self, sp: Span) -> hir::Expr {

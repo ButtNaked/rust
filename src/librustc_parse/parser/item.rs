@@ -1,28 +1,28 @@
-use super::{Parser, PathStyle};
+use super::{Parser, PathStyle, FollowedByType};
 use super::diagnostics::{Error, dummy_arg, ConsumeClosingDelim};
 
 use crate::maybe_whole;
 
+use rustc_errors::{PResult, Applicability, DiagnosticBuilder, StashKey};
+use rustc_error_codes::*;
 use syntax::ast::{self, DUMMY_NODE_ID, Ident, Attribute, AttrKind, AttrStyle, AnonConst, Item};
 use syntax::ast::{ItemKind, ImplItem, ImplItemKind, TraitItem, TraitItemKind, UseTree, UseTreeKind};
 use syntax::ast::{PathSegment, IsAuto, Constness, IsAsync, Unsafety, Defaultness, Extern, StrLit};
 use syntax::ast::{Visibility, VisibilityKind, Mutability, FnHeader, ForeignItem, ForeignItemKind};
-use syntax::ast::{Ty, TyKind, Generics, TraitRef, EnumDef, VariantData, StructField};
-use syntax::ast::{Mac, MacDelimiter, Block, BindingMode, FnDecl, FnSig, SelfKind, Param};
+use syntax::ast::{Ty, TyKind, Generics, TraitRef, EnumDef, Variant, VariantData, StructField};
+use syntax::ast::{Mac, MacArgs, MacDelimiter, Block, BindingMode, FnDecl, FnSig, SelfKind, Param};
+use syntax::print::pprust;
 use syntax::ptr::P;
 use syntax::ThinVec;
 use syntax::token;
-use syntax::tokenstream::{TokenTree, TokenStream};
-use syntax::source_map::{self, respan, Span};
+use syntax::tokenstream::{DelimSpan, TokenTree, TokenStream};
 use syntax::struct_span_err;
 use syntax_pos::BytePos;
-use syntax_pos::symbol::{kw, sym};
-
-use rustc_error_codes::*;
+use syntax_pos::source_map::{self, respan, Span};
+use syntax_pos::symbol::{kw, sym, Symbol};
 
 use log::debug;
 use std::mem;
-use errors::{PResult, Applicability, DiagnosticBuilder, StashKey};
 
 pub(super) type ItemInfo = (Ident, ItemKind, Option<Vec<Attribute>>);
 
@@ -87,7 +87,7 @@ impl<'a> Parser<'a> {
 
         let lo = self.token.span;
 
-        let vis = self.parse_visibility(false)?;
+        let vis = self.parse_visibility(FollowedByType::No)?;
 
         if self.eat_keyword(kw::Use) {
             // USE ITEM
@@ -431,22 +431,18 @@ impl<'a> Parser<'a> {
             let prev_span = self.prev_span;
             self.complain_if_pub_macro(&visibility.node, prev_span);
 
-            let mac_lo = self.token.span;
-
             // Item macro
             let path = self.parse_path(PathStyle::Mod)?;
             self.expect(&token::Not)?;
-            let (delim, tts) = self.expect_delimited_token_tree()?;
-            if delim != MacDelimiter::Brace && !self.eat(&token::Semi) {
+            let args = self.parse_mac_args()?;
+            if args.need_semicolon() && !self.eat(&token::Semi) {
                 self.report_invalid_macro_expansion_item();
             }
 
             let hi = self.prev_span;
             let mac = Mac {
                 path,
-                tts,
-                delim,
-                span: mac_lo.to(hi),
+                args,
                 prior_type_ascription: self.last_type_ascription,
             };
             let item =
@@ -490,13 +486,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a macro invocation inside a `trait`, `impl` or `extern` block.
-    fn parse_assoc_macro_invoc(&mut self, item_kind: &str, vis: Option<&Visibility>,
-                               at_end: &mut bool) -> PResult<'a, Option<Mac>>
-    {
+    fn parse_assoc_macro_invoc(
+        &mut self,
+        item_kind: &str,
+        vis: Option<&Visibility>,
+        at_end: &mut bool,
+    ) -> PResult<'a, Option<Mac>> {
         if self.token.is_path_start() &&
                 !(self.is_async_fn() && self.token.span.rust_2015()) {
             let prev_span = self.prev_span;
-            let lo = self.token.span;
             let path = self.parse_path(PathStyle::Mod)?;
 
             if path.segments.len() == 1 {
@@ -514,16 +512,14 @@ impl<'a> Parser<'a> {
             *at_end = true;
 
             // eat a matched-delimiter token tree:
-            let (delim, tts) = self.expect_delimited_token_tree()?;
-            if delim != MacDelimiter::Brace {
+            let args = self.parse_mac_args()?;
+            if args.need_semicolon() {
                 self.expect_semi()?;
             }
 
             Ok(Some(Mac {
                 path,
-                tts,
-                delim,
-                span: lo.to(self.prev_span),
+                args,
                 prior_type_ascription: self.last_type_ascription,
             }))
         } else {
@@ -531,9 +527,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn missing_assoc_item_kind_err(&self, item_type: &str, prev_span: Span)
-                                   -> DiagnosticBuilder<'a>
-    {
+    fn missing_assoc_item_kind_err(
+        &self,
+        item_type: &str,
+        prev_span: Span,
+    ) -> DiagnosticBuilder<'a> {
         let expected_kinds = if item_type == "extern" {
             "missing `fn`, `type`, or `static`"
         } else {
@@ -696,7 +694,7 @@ impl<'a> Parser<'a> {
         mut attrs: Vec<Attribute>,
     ) -> PResult<'a, ImplItem> {
         let lo = self.token.span;
-        let vis = self.parse_visibility(false)?;
+        let vis = self.parse_visibility(FollowedByType::No)?;
         let defaultness = self.parse_defaultness();
         let (name, kind, generics) = if self.eat_keyword(kw::Type) {
             let (name, ty, generics) = self.parse_type_alias()?;
@@ -883,7 +881,7 @@ impl<'a> Parser<'a> {
         mut attrs: Vec<Attribute>,
     ) -> PResult<'a, TraitItem> {
         let lo = self.token.span;
-        self.eat_bad_pub();
+        let vis = self.parse_visibility(FollowedByType::No)?;
         let (name, kind, generics) = if self.eat_keyword(kw::Type) {
             self.parse_trait_item_assoc_ty()?
         } else if self.is_const_item() {
@@ -899,6 +897,7 @@ impl<'a> Parser<'a> {
             id: DUMMY_NODE_ID,
             ident: name,
             attrs,
+            vis,
             generics,
             kind,
             span: lo.to(self.prev_span),
@@ -1129,7 +1128,7 @@ impl<'a> Parser<'a> {
 
         let attrs = self.parse_outer_attributes()?;
         let lo = self.token.span;
-        let visibility = self.parse_visibility(false)?;
+        let visibility = self.parse_visibility(FollowedByType::No)?;
 
         // FOREIGN STATIC ITEM
         // Treat `const` as `static` for error recovery, but don't add it to expected tokens.
@@ -1182,6 +1181,7 @@ impl<'a> Parser<'a> {
                         attrs,
                         vis: visibility,
                         kind: ForeignItemKind::Macro(mac),
+                        tokens: None,
                     }
                 )
             }
@@ -1212,6 +1212,7 @@ impl<'a> Parser<'a> {
             id: DUMMY_NODE_ID,
             span: lo.to(hi),
             vis,
+            tokens: None,
         })
     }
 
@@ -1229,7 +1230,8 @@ impl<'a> Parser<'a> {
             kind: ForeignItemKind::Ty,
             id: DUMMY_NODE_ID,
             span: lo.to(hi),
-            vis
+            vis,
+            tokens: None,
         })
     }
 
@@ -1322,78 +1324,65 @@ impl<'a> Parser<'a> {
         let id = self.parse_ident()?;
         let mut generics = self.parse_generics()?;
         generics.where_clause = self.parse_where_clause()?;
-        self.expect(&token::OpenDelim(token::Brace))?;
 
-        let enum_definition = self.parse_enum_def(&generics).map_err(|e| {
+        let (variants, _) = self.parse_delim_comma_seq(
+            token::Brace,
+            |p| p.parse_enum_variant(),
+        ).map_err(|e| {
             self.recover_stmt();
-            self.eat(&token::CloseDelim(token::Brace));
             e
         })?;
+
+        let enum_definition = EnumDef {
+            variants: variants.into_iter().filter_map(|v| v).collect(),
+        };
         Ok((id, ItemKind::Enum(enum_definition, generics), None))
     }
 
-    /// Parses the part of an enum declaration following the `{`.
-    fn parse_enum_def(&mut self, _generics: &Generics) -> PResult<'a, EnumDef> {
-        let mut variants = Vec::new();
-        while self.token != token::CloseDelim(token::Brace) {
-            let variant_attrs = self.parse_outer_attributes()?;
-            let vlo = self.token.span;
+    fn parse_enum_variant(&mut self) -> PResult<'a, Option<Variant>> {
+        let variant_attrs = self.parse_outer_attributes()?;
+        let vlo = self.token.span;
 
-            self.eat_bad_pub();
-            let ident = self.parse_ident()?;
-
-            let struct_def = if self.check(&token::OpenDelim(token::Brace)) {
-                // Parse a struct variant.
-                let (fields, recovered) = self.parse_record_struct_body()?;
-                VariantData::Struct(fields, recovered)
-            } else if self.check(&token::OpenDelim(token::Paren)) {
-                VariantData::Tuple(
-                    self.parse_tuple_struct_body()?,
-                    DUMMY_NODE_ID,
-                )
-            } else {
-                VariantData::Unit(DUMMY_NODE_ID)
-            };
-
-            let disr_expr = if self.eat(&token::Eq) {
-                Some(AnonConst {
-                    id: DUMMY_NODE_ID,
-                    value: self.parse_expr()?,
-                })
-            } else {
-                None
-            };
-
-            let vr = ast::Variant {
-                ident,
-                id: DUMMY_NODE_ID,
-                attrs: variant_attrs,
-                data: struct_def,
-                disr_expr,
-                span: vlo.to(self.prev_span),
-                is_placeholder: false,
-            };
-            variants.push(vr);
-
-            if !self.eat(&token::Comma) {
-                if self.token.is_ident() && !self.token.is_reserved_ident() {
-                    let sp = self.sess.source_map().next_point(self.prev_span);
-                    self.struct_span_err(sp, "missing comma")
-                        .span_suggestion_short(
-                            sp,
-                            "missing comma",
-                            ",".to_owned(),
-                            Applicability::MaybeIncorrect,
-                        )
-                        .emit();
-                } else {
-                    break;
-                }
-            }
+        let vis = self.parse_visibility(FollowedByType::No)?;
+        if !self.recover_nested_adt_item(kw::Enum)? {
+            return Ok(None)
         }
-        self.expect(&token::CloseDelim(token::Brace))?;
+        let ident = self.parse_ident()?;
 
-        Ok(ast::EnumDef { variants })
+        let struct_def = if self.check(&token::OpenDelim(token::Brace)) {
+            // Parse a struct variant.
+            let (fields, recovered) = self.parse_record_struct_body()?;
+            VariantData::Struct(fields, recovered)
+        } else if self.check(&token::OpenDelim(token::Paren)) {
+            VariantData::Tuple(
+                self.parse_tuple_struct_body()?,
+                DUMMY_NODE_ID,
+            )
+        } else {
+            VariantData::Unit(DUMMY_NODE_ID)
+        };
+
+        let disr_expr = if self.eat(&token::Eq) {
+            Some(AnonConst {
+                id: DUMMY_NODE_ID,
+                value: self.parse_expr()?,
+            })
+        } else {
+            None
+        };
+
+        let vr = ast::Variant {
+            ident,
+            vis,
+            id: DUMMY_NODE_ID,
+            attrs: variant_attrs,
+            data: struct_def,
+            disr_expr,
+            span: vlo.to(self.prev_span),
+            is_placeholder: false,
+        };
+
+        Ok(Some(vr))
     }
 
     /// Parses `struct Foo { ... }`.
@@ -1519,7 +1508,7 @@ impl<'a> Parser<'a> {
         self.parse_paren_comma_seq(|p| {
             let attrs = p.parse_outer_attributes()?;
             let lo = p.token.span;
-            let vis = p.parse_visibility(true)?;
+            let vis = p.parse_visibility(FollowedByType::Yes)?;
             let ty = p.parse_ty()?;
             Ok(StructField {
                 span: lo.to(ty.span),
@@ -1537,7 +1526,7 @@ impl<'a> Parser<'a> {
     fn parse_struct_decl_field(&mut self) -> PResult<'a, StructField> {
         let attrs = self.parse_outer_attributes()?;
         let lo = self.token.span;
-        let vis = self.parse_visibility(false)?;
+        let vis = self.parse_visibility(FollowedByType::No)?;
         self.parse_single_struct_field(lo, vis, attrs)
     }
 
@@ -1630,33 +1619,31 @@ impl<'a> Parser<'a> {
         vis: &Visibility,
         lo: Span
     ) -> PResult<'a, Option<P<Item>>> {
-        let token_lo = self.token.span;
         let (ident, def) = if self.eat_keyword(kw::Macro) {
             let ident = self.parse_ident()?;
-            let tokens = if self.check(&token::OpenDelim(token::Brace)) {
-                match self.parse_token_tree() {
-                    TokenTree::Delimited(_, _, tts) => tts,
-                    _ => unreachable!(),
-                }
+            let body = if self.check(&token::OpenDelim(token::Brace)) {
+                self.parse_mac_args()?
             } else if self.check(&token::OpenDelim(token::Paren)) {
-                let args = self.parse_token_tree();
+                let params = self.parse_token_tree();
+                let pspan = params.span();
                 let body = if self.check(&token::OpenDelim(token::Brace)) {
                     self.parse_token_tree()
                 } else {
-                    self.unexpected()?;
-                    unreachable!()
+                    return self.unexpected();
                 };
-                TokenStream::new(vec![
-                    args.into(),
-                    TokenTree::token(token::FatArrow, token_lo.to(self.prev_span)).into(),
+                let bspan = body.span();
+                let tokens = TokenStream::new(vec![
+                    params.into(),
+                    TokenTree::token(token::FatArrow, pspan.between(bspan)).into(),
                     body.into(),
-                ])
+                ]);
+                let dspan = DelimSpan::from_pair(pspan.shrink_to_lo(), bspan.shrink_to_hi());
+                P(MacArgs::Delimited(dspan, MacDelimiter::Brace, tokens))
             } else {
-                self.unexpected()?;
-                unreachable!()
+                return self.unexpected();
             };
 
-            (ident, ast::MacroDef { tokens: tokens.into(), legacy: false })
+            (ident, ast::MacroDef { body, legacy: false })
         } else if self.check_keyword(sym::macro_rules) &&
                   self.look_ahead(1, |t| *t == token::Not) &&
                   self.look_ahead(2, |t| t.is_ident()) {
@@ -1666,12 +1653,12 @@ impl<'a> Parser<'a> {
             self.bump();
 
             let ident = self.parse_ident()?;
-            let (delim, tokens) = self.expect_delimited_token_tree()?;
-            if delim != MacDelimiter::Brace && !self.eat(&token::Semi) {
+            let body = self.parse_mac_args()?;
+            if body.need_semicolon() && !self.eat(&token::Semi) {
                 self.report_invalid_macro_expansion_item();
             }
 
-            (ident, ast::MacroDef { tokens, legacy: true })
+            (ident, ast::MacroDef { body, legacy: true })
         } else {
             return Ok(None);
         };
@@ -1738,6 +1725,33 @@ impl<'a> Parser<'a> {
             ';'.to_string(),
             Applicability::MaybeIncorrect,
         ).emit();
+    }
+
+    /// Checks if current token is one of tokens which cannot be nested like `kw::Enum`. In case
+    /// it is, we try to parse the item and report error about nested types.
+    fn recover_nested_adt_item(&mut self, keyword: Symbol) -> PResult<'a, bool> {
+        if (self.token.is_keyword(kw::Enum) ||
+            self.token.is_keyword(kw::Struct) ||
+            self.token.is_keyword(kw::Union))
+           && self.look_ahead(1, |t| t.is_ident())
+        {
+            let kw_token = self.token.clone();
+            let kw_str = pprust::token_to_string(&kw_token);
+            let item = self.parse_item()?;
+
+            self.struct_span_err(
+                kw_token.span,
+                &format!("`{}` definition cannot be nested inside `{}`", kw_str, keyword),
+            ).span_suggestion(
+                item.unwrap().span,
+                &format!("consider creating a new `{}` definition instead of nesting", kw_str),
+                String::new(),
+                Applicability::MaybeIncorrect,
+            ).emit();
+            // We successfully parsed the item but we must inform the caller about nested problem.
+            return Ok(false)
+        }
+        Ok(true)
     }
 
     fn mk_item(&self, span: Span, ident: Ident, kind: ItemKind, vis: Visibility,
@@ -1815,6 +1829,7 @@ impl<'a> Parser<'a> {
             id: DUMMY_NODE_ID,
             span,
             vis,
+            tokens: None,
         })
     }
 
@@ -1992,7 +2007,7 @@ impl<'a> Parser<'a> {
 
         let mut params: Vec<_> = params.into_iter().filter_map(|x| x).collect();
 
-        // Replace duplicated recovered params with `_` pattern to avoid unecessary errors.
+        // Replace duplicated recovered params with `_` pattern to avoid unnecessary errors.
         self.deduplicate_recovered_params_names(&mut params);
 
         if c_variadic && params.len() <= 1 {

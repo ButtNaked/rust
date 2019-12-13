@@ -5,17 +5,44 @@ use rustc::ty::{self, Ty};
 use rustc::ty::layout::{self, HasTyCtxt};
 use syntax::source_map::Span;
 use crate::traits::*;
+use crate::mir::operand::OperandRef;
 
 use super::FunctionCx;
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
+    pub fn eval_mir_constant_to_operand(
+        &mut self,
+        bx: &mut Bx,
+        constant: &mir::Constant<'tcx>,
+    ) -> Result<OperandRef<'tcx, Bx::Value>, ErrorHandled> {
+        match constant.literal.val {
+            // Special case unevaluated statics, because statics have an identity and thus should
+            // use `get_static` to get at their id.
+            // FIXME(oli-obk): can we unify this somehow, maybe by making const eval of statics
+            // always produce `&STATIC`. This may also simplify how const eval works with statics.
+            ty::ConstKind::Unevaluated(def_id, substs)
+                if self.cx.tcx().is_static(def_id) => {
+                    assert!(substs.is_empty(), "we don't support generic statics yet");
+                    let static_ = bx.get_static(def_id);
+                    // we treat operands referring to statics as if they were `&STATIC` instead
+                    let ptr_ty = self.cx.tcx().mk_mut_ptr(self.monomorphize(&constant.literal.ty));
+                    let layout = bx.layout_of(ptr_ty);
+                    Ok(OperandRef::from_immediate_or_packed_pair(bx, static_, layout))
+                }
+            _ => {
+                let val = self.eval_mir_constant(constant)?;
+                Ok(OperandRef::from_const(bx, val))
+            }
+        }
+    }
+
     pub fn eval_mir_constant(
         &mut self,
         constant: &mir::Constant<'tcx>,
     ) -> Result<&'tcx ty::Const<'tcx>, ErrorHandled> {
         match constant.literal.val {
-            ty::ConstKind::Unevaluated(def_id, ref substs) => {
-                let substs = self.monomorphize(substs);
+            ty::ConstKind::Unevaluated(def_id, substs) => {
+                let substs = self.monomorphize(&substs);
                 let instance = ty::Instance::resolve(
                     self.cx.tcx(), ty::ParamEnv::reveal_all(), def_id, substs,
                 ).unwrap();
@@ -23,7 +50,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     instance,
                     promoted: None,
                 };
-                self.cx.tcx().const_eval(ty::ParamEnv::reveal_all().and(cid))
+                self.cx.tcx().const_eval(ty::ParamEnv::reveal_all().and(cid)).map_err(|err| {
+                    self.cx.tcx().sess.span_err(constant.span, "erroneous constant encountered");
+                    err
+                })
             },
             _ => Ok(self.monomorphize(&constant.literal)),
         }

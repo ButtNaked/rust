@@ -298,6 +298,12 @@ impl<'test> TestCx<'test> {
     /// Code executed for each revision in turn (or, if there are no
     /// revisions, exactly once, with revision == None).
     fn run_revision(&self) {
+        if self.props.should_ice {
+            if self.config.mode != CompileFail &&
+                self.config.mode != Incremental {
+                self.fatal("cannot use should-ice in a test that is not cfail");
+            }
+        }
         match self.config.mode {
             CompileFail => self.run_cfail_test(),
             RunFail => self.run_rfail_test(),
@@ -383,7 +389,7 @@ impl<'test> TestCx<'test> {
     fn run_cfail_test(&self) {
         let proc_res = self.compile_test();
         self.check_if_test_should_compile(&proc_res);
-        self.check_no_compiler_crash(&proc_res);
+        self.check_no_compiler_crash(&proc_res, self.props.should_ice);
 
         let output_to_check = self.get_output(&proc_res);
         let expected_errors = errors::load_errors(&self.testpaths.file, self.revision);
@@ -394,6 +400,12 @@ impl<'test> TestCx<'test> {
             self.check_expected_errors(expected_errors, &proc_res);
         } else {
             self.check_error_patterns(&output_to_check, &proc_res);
+        }
+        if self.props.should_ice {
+            match proc_res.status.code() {
+                Some(101) => (),
+                _ => self.fatal("expected ICE"),
+            }
         }
 
         self.check_forbid_output(&output_to_check, &proc_res);
@@ -1402,9 +1414,11 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn check_no_compiler_crash(&self, proc_res: &ProcRes) {
+    fn check_no_compiler_crash(&self, proc_res: &ProcRes, should_ice: bool) {
         match proc_res.status.code() {
-            Some(101) => self.fatal_proc_rec("compiler encountered internal error", proc_res),
+            Some(101) if !should_ice => {
+                self.fatal_proc_rec("compiler encountered internal error", proc_res)
+            }
             None => self.fatal_proc_rec("compiler terminated by signal", proc_res),
             _ => (),
         }
@@ -1762,93 +1776,16 @@ impl<'test> TestCx<'test> {
             create_dir_all(&aux_dir).unwrap();
         }
 
-        // Use a Vec instead of a HashMap to preserve original order
-        let mut extern_priv = self.props.extern_private.clone();
-
-        let mut add_extern_priv = |priv_dep: &str, dylib: bool| {
-            let lib_name = get_lib_name(priv_dep, dylib);
-            rustc
-                .arg("--extern-private")
-                .arg(format!("{}={}", priv_dep, aux_dir.join(lib_name).to_str().unwrap()));
-        };
-
         for rel_ab in &self.props.aux_builds {
-            let aux_testpaths = self.compute_aux_test_paths(rel_ab);
-            let aux_props =
-                self.props
-                    .from_aux_file(&aux_testpaths.file, self.revision, self.config);
-            let aux_output = TargetLocation::ThisDirectory(self.aux_output_dir_name());
-            let aux_cx = TestCx {
-                config: self.config,
-                props: &aux_props,
-                testpaths: &aux_testpaths,
-                revision: self.revision,
-            };
-            // Create the directory for the stdout/stderr files.
-            create_dir_all(aux_cx.output_base_dir()).unwrap();
-            let mut aux_rustc = aux_cx.make_compile_args(&aux_testpaths.file, aux_output);
-
-            let (dylib, crate_type) = if aux_props.no_prefer_dynamic {
-                (true, None)
-            } else if self.config.target.contains("cloudabi")
-                || self.config.target.contains("emscripten")
-                || (self.config.target.contains("musl")
-                    && !aux_props.force_host
-                    && !self.config.host.contains("musl"))
-                || self.config.target.contains("wasm32")
-                || self.config.target.contains("nvptx")
-                || self.is_vxworks_pure_static()
-            {
-                // We primarily compile all auxiliary libraries as dynamic libraries
-                // to avoid code size bloat and large binaries as much as possible
-                // for the test suite (otherwise including libstd statically in all
-                // executables takes up quite a bit of space).
-                //
-                // For targets like MUSL or Emscripten, however, there is no support for
-                // dynamic libraries so we just go back to building a normal library. Note,
-                // however, that for MUSL if the library is built with `force_host` then
-                // it's ok to be a dylib as the host should always support dylibs.
-                (false, Some("lib"))
-            } else {
-                (true, Some("dylib"))
-            };
-
-            let trimmed = rel_ab.trim_end_matches(".rs").to_string();
-
-            // Normally, every 'extern-private' has a correspodning 'aux-build'
-            // entry. If so, we remove it from our list of private crates,
-            // and add an '--extern-private' flag to rustc
-            if extern_priv.remove_item(&trimmed).is_some() {
-                add_extern_priv(&trimmed, dylib);
-            }
-
-            if let Some(crate_type) = crate_type {
-                aux_rustc.args(&["--crate-type", crate_type]);
-            }
-
-            aux_rustc.arg("-L").arg(&aux_dir);
-
-            let auxres = aux_cx.compose_and_run(
-                aux_rustc,
-                aux_cx.config.compile_lib_path.to_str().unwrap(),
-                Some(aux_dir.to_str().unwrap()),
-                None,
-            );
-            if !auxres.status.success() {
-                self.fatal_proc_rec(
-                    &format!(
-                        "auxiliary build of {:?} failed to compile: ",
-                        aux_testpaths.file.display()
-                    ),
-                    &auxres,
-                );
-            }
+            self.build_auxiliary(rel_ab, &aux_dir);
         }
 
-        // Add any '--extern-private' entries without a matching
-        // 'aux-build'
-        for private_lib in extern_priv {
-            add_extern_priv(&private_lib, true);
+        for (aux_name, aux_path) in &self.props.aux_crates {
+            let is_dylib = self.build_auxiliary(&aux_path, &aux_dir);
+            let lib_name = get_lib_name(&aux_path.trim_end_matches(".rs").replace('-', "_"),
+                is_dylib);
+            rustc.arg("--extern")
+                .arg(format!("{}={}/{}", aux_name, aux_dir.display(), lib_name));
         }
 
         self.props.unset_rustc_env.clone()
@@ -1861,6 +1798,74 @@ impl<'test> TestCx<'test> {
             Some(aux_dir.to_str().unwrap()),
             input,
         )
+    }
+
+    /// Builds an aux dependency.
+    ///
+    /// Returns whether or not it is a dylib.
+    fn build_auxiliary(&self, source_path: &str, aux_dir: &Path) -> bool {
+        let aux_testpaths = self.compute_aux_test_paths(source_path);
+        let aux_props =
+            self.props
+                .from_aux_file(&aux_testpaths.file, self.revision, self.config);
+        let aux_output = TargetLocation::ThisDirectory(self.aux_output_dir_name());
+        let aux_cx = TestCx {
+            config: self.config,
+            props: &aux_props,
+            testpaths: &aux_testpaths,
+            revision: self.revision,
+        };
+        // Create the directory for the stdout/stderr files.
+        create_dir_all(aux_cx.output_base_dir()).unwrap();
+        let mut aux_rustc = aux_cx.make_compile_args(&aux_testpaths.file, aux_output);
+
+        let (dylib, crate_type) = if aux_props.no_prefer_dynamic {
+            (true, None)
+        } else if self.config.target.contains("cloudabi")
+            || self.config.target.contains("emscripten")
+            || (self.config.target.contains("musl")
+                && !aux_props.force_host
+                && !self.config.host.contains("musl"))
+            || self.config.target.contains("wasm32")
+            || self.config.target.contains("nvptx")
+            || self.is_vxworks_pure_static()
+        {
+            // We primarily compile all auxiliary libraries as dynamic libraries
+            // to avoid code size bloat and large binaries as much as possible
+            // for the test suite (otherwise including libstd statically in all
+            // executables takes up quite a bit of space).
+            //
+            // For targets like MUSL or Emscripten, however, there is no support for
+            // dynamic libraries so we just go back to building a normal library. Note,
+            // however, that for MUSL if the library is built with `force_host` then
+            // it's ok to be a dylib as the host should always support dylibs.
+            (false, Some("lib"))
+        } else {
+            (true, Some("dylib"))
+        };
+
+        if let Some(crate_type) = crate_type {
+            aux_rustc.args(&["--crate-type", crate_type]);
+        }
+
+        aux_rustc.arg("-L").arg(&aux_dir);
+
+        let auxres = aux_cx.compose_and_run(
+            aux_rustc,
+            aux_cx.config.compile_lib_path.to_str().unwrap(),
+            Some(aux_dir.to_str().unwrap()),
+            None,
+        );
+        if !auxres.status.success() {
+            self.fatal_proc_rec(
+                &format!(
+                    "auxiliary build of {:?} failed to compile: ",
+                    aux_testpaths.file.display()
+                ),
+                &auxres,
+            );
+        }
+        dylib
     }
 
     fn compose_and_run(
@@ -2518,7 +2523,7 @@ impl<'test> TestCx<'test> {
             self.fatal_proc_rec("compilation failed!", &proc_res);
         }
 
-        self.check_no_compiler_crash(&proc_res);
+        self.check_no_compiler_crash(&proc_res, self.props.should_ice);
 
         const PREFIX: &'static str = "MONO_ITEM ";
         const CGU_MARKER: &'static str = "@@";
@@ -2774,8 +2779,14 @@ impl<'test> TestCx<'test> {
         }
 
         if revision.starts_with("rpass") {
+            if revision_cx.props.should_ice {
+                revision_cx.fatal("can only use should-ice in cfail tests");
+            }
             revision_cx.run_rpass_test();
         } else if revision.starts_with("rfail") {
+            if revision_cx.props.should_ice {
+                revision_cx.fatal("can only use should-ice in cfail tests");
+            }
             revision_cx.run_rfail_test();
         } else if revision.starts_with("cfail") {
             revision_cx.run_cfail_test();

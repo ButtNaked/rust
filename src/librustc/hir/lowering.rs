@@ -1003,7 +1003,7 @@ impl<'a> LoweringContext<'a> {
             AttrKind::Normal(ref item) => {
                 AttrKind::Normal(AttrItem {
                     path: item.path.clone(),
-                    tokens: self.lower_token_stream(item.tokens.clone()),
+                    args: self.lower_mac_args(&item.args),
                 })
             }
             AttrKind::DocComment(comment) => AttrKind::DocComment(comment)
@@ -1014,6 +1014,16 @@ impl<'a> LoweringContext<'a> {
             id: attr.id,
             style: attr.style,
             span: attr.span,
+        }
+    }
+
+    fn lower_mac_args(&mut self, args: &MacArgs) -> MacArgs {
+        match *args {
+            MacArgs::Empty => MacArgs::Empty,
+            MacArgs::Delimited(dspan, delim, ref tokens) =>
+                MacArgs::Delimited(dspan, delim, self.lower_token_stream(tokens.clone())),
+            MacArgs::Eq(eq_span, ref tokens) =>
+                MacArgs::Eq(eq_span, self.lower_token_stream(tokens.clone())),
         }
     }
 
@@ -1155,13 +1165,64 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
-    fn lower_generic_arg(&mut self,
-                         arg: &ast::GenericArg,
-                         itctx: ImplTraitContext<'_>)
-                         -> hir::GenericArg {
+    fn lower_generic_arg(
+        &mut self,
+        arg: &ast::GenericArg,
+        itctx: ImplTraitContext<'_>
+    ) -> hir::GenericArg {
         match arg {
             ast::GenericArg::Lifetime(lt) => GenericArg::Lifetime(self.lower_lifetime(&lt)),
-            ast::GenericArg::Type(ty) => GenericArg::Type(self.lower_ty_direct(&ty, itctx)),
+            ast::GenericArg::Type(ty) => {
+                // We parse const arguments as path types as we cannot distiguish them durring
+                // parsing. We try to resolve that ambiguity by attempting resolution in both the
+                // type and value namespaces. If we resolved the path in the value namespace, we
+                // transform it into a generic const argument.
+                if let TyKind::Path(ref qself, ref path) = ty.kind {
+                    if let Some(partial_res) = self.resolver.get_partial_res(ty.id) {
+                        let res = partial_res.base_res();
+                        if !res.matches_ns(Namespace::TypeNS) {
+                            debug!(
+                                "lower_generic_arg: Lowering type argument as const argument: {:?}",
+                                ty,
+                            );
+
+                            // Construct a AnonConst where the expr is the "ty"'s path.
+
+                            let parent_def_index =
+                                self.current_hir_id_owner.last().unwrap().0;
+                            let node_id = self.resolver.next_node_id();
+
+                            // Add a definition for the in-band const def.
+                            self.resolver.definitions().create_def_with_parent(
+                                parent_def_index,
+                                node_id,
+                                DefPathData::AnonConst,
+                                ExpnId::root(),
+                                ty.span,
+                            );
+
+                            let path_expr = Expr {
+                                id: ty.id,
+                                kind: ExprKind::Path(qself.clone(), path.clone()),
+                                span: ty.span,
+                                attrs: ThinVec::new(),
+                            };
+
+                            let ct = self.with_new_scopes(|this| {
+                                hir::AnonConst {
+                                    hir_id: this.lower_node_id(node_id),
+                                    body: this.lower_const_body(&path_expr),
+                                }
+                            });
+                            return GenericArg::Const(ConstArg {
+                                value: ct,
+                                span: ty.span,
+                            });
+                        }
+                    }
+                }
+                GenericArg::Type(self.lower_ty_direct(&ty, itctx))
+            }
             ast::GenericArg::Const(ct) => {
                 GenericArg::Const(ConstArg {
                     value: self.lower_anon_const(&ct),
@@ -2119,6 +2180,16 @@ impl<'a> LoweringContext<'a> {
         impl_trait_return_allow: bool,
         make_ret_async: Option<NodeId>,
     ) -> P<hir::FnDecl> {
+        debug!("lower_fn_decl(\
+            fn_decl: {:?}, \
+            in_band_ty_params: {:?}, \
+            impl_trait_return_allow: {}, \
+            make_ret_async: {:?})",
+            decl,
+            in_band_ty_params,
+            impl_trait_return_allow,
+            make_ret_async,
+        );
         let lt_mode = if make_ret_async.is_some() {
             // In `async fn`, argument-position elided lifetimes
             // must be transformed into fresh generic parameters so that
@@ -2411,7 +2482,7 @@ impl<'a> LoweringContext<'a> {
 
         hir::FunctionRetTy::Return(P(hir::Ty {
             kind: opaque_ty_ref,
-            span,
+            span: opaque_ty_span,
             hir_id: self.next_id(),
         }))
     }
@@ -2521,7 +2592,7 @@ impl<'a> LoweringContext<'a> {
         hir::Lifetime {
             hir_id: self.lower_node_id(id),
             span,
-            name: name,
+            name,
         }
     }
 

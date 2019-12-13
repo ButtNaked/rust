@@ -71,6 +71,7 @@ pub struct EarlyProps {
     pub ignore: Ignore,
     pub should_fail: bool,
     pub aux: Vec<String>,
+    pub aux_crate: Vec<(String, String)>,
     pub revisions: Vec<String>,
 }
 
@@ -80,6 +81,7 @@ impl EarlyProps {
             ignore: Ignore::Run,
             should_fail: false,
             aux: Vec::new(),
+            aux_crate: Vec::new(),
             revisions: vec![],
         };
 
@@ -155,6 +157,10 @@ impl EarlyProps {
 
             if let Some(s) = config.parse_aux_build(ln) {
                 props.aux.push(s);
+            }
+
+            if let Some(ac) = config.parse_aux_crate(ln) {
+                props.aux_crate.push(ac);
             }
 
             if let Some(r) = config.parse_revisions(ln) {
@@ -311,10 +317,9 @@ pub struct TestProps {
     // directory as the test, but for backwards compatibility reasons
     // we also check the auxiliary directory)
     pub aux_builds: Vec<String>,
-    // A list of crates to pass '--extern-private name:PATH' flags for
-    // This should be a subset of 'aux_build'
-    // FIXME: Replace this with a better solution: https://github.com/rust-lang/rust/pull/54020
-    pub extern_private: Vec<String>,
+    // Similar to `aux_builds`, but a list of NAME=somelib.rs of dependencies
+    // to build and pass with the `--extern` flag.
+    pub aux_crates: Vec<(String, String)>,
     // Environment settings to use for compiling
     pub rustc_env: Vec<(String, String)>,
     // Environment variables to unset prior to compiling.
@@ -375,6 +380,8 @@ pub struct TestProps {
     // If true, `rustfix` will only apply `MachineApplicable` suggestions.
     pub rustfix_only_machine_applicable: bool,
     pub assembly_output: Option<String>,
+    // If true, the test is expected to ICE
+    pub should_ice: bool,
 }
 
 impl TestProps {
@@ -385,7 +392,7 @@ impl TestProps {
             run_flags: None,
             pp_exact: None,
             aux_builds: vec![],
-            extern_private: vec![],
+            aux_crates: vec![],
             revisions: vec![],
             rustc_env: vec![],
             unset_rustc_env: vec![],
@@ -413,6 +420,7 @@ impl TestProps {
             run_rustfix: false,
             rustfix_only_machine_applicable: false,
             assembly_output: None,
+            should_ice: false,
         }
     }
 
@@ -463,6 +471,10 @@ impl TestProps {
                 self.pp_exact = config.parse_pp_exact(ln, testfile);
             }
 
+            if !self.should_ice {
+                self.should_ice = config.parse_should_ice(ln);
+            }
+
             if !self.build_aux_docs {
                 self.build_aux_docs = config.parse_build_aux_docs(ln);
             }
@@ -507,8 +519,8 @@ impl TestProps {
                 self.aux_builds.push(ab);
             }
 
-            if let Some(ep) = config.parse_extern_private(ln) {
-                self.extern_private.push(ep);
+            if let Some(ac) = config.parse_aux_crate(ln) {
+                self.aux_crates.push(ac);
             }
 
             if let Some(ee) = config.parse_env(ln, "exec-env") {
@@ -576,6 +588,9 @@ impl TestProps {
                 Mode::RunFail => 101,
                 _ => 1,
             };
+        }
+        if self.should_ice {
+            self.failure_status = 101;
         }
 
         for key in &["RUST_TEST_NOCAPTURE", "RUST_TEST_THREADS"] {
@@ -687,6 +702,9 @@ fn iter_header(testfile: &Path, cfg: Option<&str>, it: &mut dyn FnMut(&str)) {
 }
 
 impl Config {
+    fn parse_should_ice(&self, line: &str) -> bool {
+        self.parse_name_directive(line, "should-ice")
+    }
     fn parse_error_pattern(&self, line: &str) -> Option<String> {
         self.parse_name_value_directive(line, "error-pattern")
     }
@@ -700,8 +718,14 @@ impl Config {
             .map(|r| r.trim().to_string())
     }
 
-    fn parse_extern_private(&self, line: &str) -> Option<String> {
-        self.parse_name_value_directive(line, "extern-private")
+    fn parse_aux_crate(&self, line: &str) -> Option<(String, String)> {
+        self.parse_name_value_directive(line, "aux-crate").map(|r| {
+            let mut parts = r.trim().splitn(2, '=');
+            (
+                parts.next().expect("aux-crate name").to_string(),
+                parts.next().expect("aux-crate value").to_string(),
+            )
+        })
     }
 
     fn parse_compile_flags(&self, line: &str) -> Option<String> {

@@ -31,7 +31,6 @@ use syntax::util::lev_distance::find_best_match_for_name;
 use syntax::source_map::{FileLoader, RealFileLoader, SourceMap};
 use syntax::symbol::{Symbol, sym};
 use syntax::{self, ast, attr};
-use syntax_expand::config::process_configure_mod;
 use syntax_pos::edition::Edition;
 #[cfg(not(parallel_compiler))]
 use std::{thread, panic};
@@ -81,7 +80,6 @@ pub fn create_session(
         source_map.clone(),
         diagnostic_output,
         lint_caps,
-        process_configure_mod,
     );
 
     sess.prof.register_queries(|profiler| {
@@ -109,11 +107,7 @@ const STACK_SIZE: usize = 16 * 1024 * 1024;
 fn get_stack_size() -> Option<usize> {
     // FIXME: Hacks on hacks. If the env is trying to override the stack size
     // then *don't* set it explicitly.
-    if env::var_os("RUST_MIN_STACK").is_none() {
-        Some(STACK_SIZE)
-    } else {
-        None
-    }
+    env::var_os("RUST_MIN_STACK").is_none().then_some(STACK_SIZE)
 }
 
 struct Sink(Arc<Mutex<Vec<u8>>>);
@@ -287,11 +281,7 @@ fn get_rustc_path_inner(bin_path: &str) -> Option<PathBuf> {
             } else {
                 "rustc"
             });
-            if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
-            }
+            candidate.exists().then_some(candidate)
         })
         .next()
 }

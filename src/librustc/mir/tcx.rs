@@ -10,7 +10,7 @@ use crate::ty::layout::VariantIdx;
 use crate::hir;
 use crate::ty::util::IntTypeExt;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, TypeFoldable)]
 pub struct PlaceTy<'tcx> {
     pub ty: Ty<'tcx>,
     /// Downcast to a particular variant of an enum, if included.
@@ -81,21 +81,24 @@ impl<'tcx> PlaceTy<'tcx> {
                 let ty = self.ty
                              .builtin_deref(true)
                              .unwrap_or_else(|| {
-                                 bug!("deref projection of non-dereferencable ty {:?}", self)
+                                 bug!("deref projection of non-dereferenceable ty {:?}", self)
                              })
                              .ty;
                 PlaceTy::from_ty(ty)
             }
             ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } =>
                 PlaceTy::from_ty(self.ty.builtin_index().unwrap()),
-            ProjectionElem::Subslice { from, to } => {
+            ProjectionElem::Subslice { from, to, from_end } => {
                 PlaceTy::from_ty(match self.ty.kind {
-                    ty::Array(inner, size) => {
+                    ty::Slice(..) => self.ty,
+                    ty::Array(inner, _) if !from_end => {
+                        tcx.mk_array(inner, (to - from) as u64)
+                    }
+                    ty::Array(inner, size) if from_end => {
                         let size = size.eval_usize(tcx, param_env);
                         let len = size - (from as u64) - (to as u64);
                         tcx.mk_array(inner, len)
                     }
-                    ty::Slice(..) => self.ty,
                     _ => {
                         bug!("cannot subslice non-array type: `{:?}`", self)
                     }
@@ -108,13 +111,6 @@ impl<'tcx> PlaceTy<'tcx> {
         };
         debug!("projection_ty self: {:?} elem: {:?} yields: {:?}", self, elem, answer);
         answer
-    }
-}
-
-BraceStructTypeFoldableImpl! {
-    impl<'tcx> TypeFoldable<'tcx> for PlaceTy<'tcx> {
-        ty,
-        variant_index,
     }
 }
 
